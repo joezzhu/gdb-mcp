@@ -133,9 +133,18 @@ class GDBSession:
             # Wait for GDB to be ready (send a no-op command and wait for result)
             # This ensures GDB has completed initialization before we send real commands
             # Timeout is based on inactivity - as long as GDB produces output, we wait
+            # Use longer timeout when loading core dumps or executables via command line,
+            # as GDB loads them during startup before responding to any commands
+            if core or program:
+                init_timeout = FILE_LOAD_TIMEOUT_SEC
+                logger.info(
+                    f"Using extended init timeout ({init_timeout}s) for core/program loading"
+                )
+            else:
+                init_timeout = DEFAULT_TIMEOUT_SEC
             logger.debug("Waiting for GDB initialization to complete...")
             ready_check = self._send_command_and_wait_for_prompt(
-                "-gdb-version", timeout_sec=DEFAULT_TIMEOUT_SEC
+                "-gdb-version", timeout_sec=init_timeout
             )
 
             if "error" in ready_check or ready_check.get("timed_out"):
@@ -158,6 +167,25 @@ class GDBSession:
                 return error_response
 
             logger.info("GDB initialized and ready")
+
+            # Apply essential GDB settings for non-interactive (MI) usage.
+            # pagination MUST be off - otherwise GDB blocks waiting for user input
+            # when output exceeds terminal height, causing all commands to timeout.
+            # print pretty improves readability of complex structures.
+            essential_settings = [
+                "set pagination off",
+                "set print pretty on",
+            ]
+            for setting_cmd in essential_settings:
+                try:
+                    escaped = setting_cmd.replace("\\", "\\\\").replace('"', '\\"')
+                    self._send_command_and_wait_for_prompt(
+                        f'-interpreter-exec console "{escaped}"',
+                        timeout_sec=DEFAULT_TIMEOUT_SEC,
+                    )
+                    logger.debug(f"Applied setting: {setting_cmd}")
+                except Exception as e:
+                    logger.warning(f"Failed to apply setting '{setting_cmd}': {e}")
 
             # Parse the version info for startup messages
             startup_result = self._parse_responses(ready_check.get("command_responses", []))
