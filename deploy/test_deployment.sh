@@ -166,13 +166,6 @@ if [[ -x "${PYTHON_VENV}" ]]; then
     else
         fail "mcp 依赖未安装"
     fi
-
-    # pygdbmi 依赖
-    if "${PYTHON_VENV}" -c "import pygdbmi" 2>/dev/null; then
-        pass "pygdbmi 依赖已安装"
-    else
-        fail "pygdbmi 依赖未安装"
-    fi
 else
     skip "虚拟环境不存在，跳过包检查"
 fi

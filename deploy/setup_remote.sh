@@ -225,8 +225,8 @@ verify_installation() {
     fi
 
     # 检查依赖
-    if ! "$python_venv" -c "import mcp; import pygdbmi" 2>/dev/null; then
-        fatal "依赖包未正确安装（mcp 或 pygdbmi）"
+    if ! "$python_venv" -c "import mcp" 2>/dev/null; then
+        fatal "依赖包未正确安装（mcp）"
     fi
 
     success "安装验证通过 ✓"

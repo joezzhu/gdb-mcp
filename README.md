@@ -5,16 +5,30 @@ An MCP (Model Context Protocol) server that provides AI assistants with programm
 ## Features
 
 - **Full GDB Control**: Start sessions, execute commands, control program execution
+- **SSH Remote Debugging**: Debug programs on remote servers — MCP Server runs locally, connects to remote GDB via SSH
+- **Local Mode Compatible**: Works with local GDB when no SSH parameters are provided
 - **Thread Analysis**: Inspect threads, get backtraces, analyze thread states
 - **Breakpoint Management**: Set conditional breakpoints, temporary breakpoints
 - **Variable Inspection**: Evaluate expressions, inspect variables and registers
 - **Core Dump Analysis**: Load and analyze core dumps with custom initialization
 - **Flexible Initialization**: Run GDB scripts or commands on startup
+- **Zero Remote Dependencies**: Remote server only needs GDB installed — no Python, no MCP deployment needed
 
 ## Architecture
 
-This server uses the **GDB/MI (Machine Interface)** protocol, which is the same interface used by professional IDEs. It provides:
+This server uses the **GDB/MI (Machine Interface)** protocol, the same interface used by professional IDEs. It supports two modes:
 
+**Local mode** (default): MCP Server starts a local GDB subprocess directly.
+
+**SSH remote mode**: MCP Server runs locally and connects to a remote GDB via SSH:
+
+```
+MCP Client (IDE)  ──stdio──►  MCP Server (local)  ──SSH──►  GDB --interpreter=mi (remote)
+                                    ↑                              ↓
+                              Local MI parsing              Remote program debugging
+```
+
+Both modes provide:
 - Structured, machine-parseable output
 - Full access to GDB's debugging capabilities
 - Reliable command execution and response handling
@@ -23,8 +37,9 @@ This server uses the **GDB/MI (Machine Interface)** protocol, which is the same 
 
 ### Prerequisites
 
-- Python 3.10 or higher
-- GDB installed and available in PATH
+- Python 3.10 or higher (on the local machine where MCP Server runs)
+- GDB installed (locally and/or on the remote server)
+- SSH client (for remote debugging mode)
 
 ### Quick Start
 
@@ -98,6 +113,41 @@ export GDB_MCP_LOG_LEVEL=DEBUG
 gdb-mcp-server
 ```
 
+### SSH Default Parameters
+
+Pre-configure SSH connection parameters so that `gdb_start_session` automatically uses SSH remote mode without needing to pass SSH parameters every time. Tool parameters always override these defaults.
+
+| Environment Variable | Description | Example |
+|---------------------|-------------|---------|
+| `GDB_SSH_HOST` | Default SSH host | `9.134.194.81` |
+| `GDB_SSH_USER` | Default SSH username | `joezzhu` |
+| `GDB_SSH_PORT` | Default SSH port (default: 22) | `36000` |
+| `GDB_SSH_KEY` | Default SSH private key path | `D:\joezzhu\pc7.key` |
+| `GDB_SSH_OPTIONS` | Extra SSH options (comma-separated) | `-o,ProxyJump=bastion` |
+
+**Example MCP client configuration with SSH defaults:**
+
+```json
+{
+  "mcpServers": {
+    "gdb": {
+      "command": "gdb-mcp-server",
+      "env": {
+        "GDB_SSH_HOST": "9.134.194.81",
+        "GDB_SSH_USER": "joezzhu",
+        "GDB_SSH_PORT": "36000",
+        "GDB_SSH_KEY": "D:\\joezzhu\\pc7.key"
+      }
+    }
+  }
+}
+```
+
+With this configuration, AI just needs to provide `program`/`core` paths — SSH connection is automatic:
+```json
+{"program": "/home/user/myapp", "core": "/home/user/core.12345"}
+```
+
 ## Available Tools
 
 The GDB MCP Server provides 22 tools for controlling GDB debugging sessions:
@@ -138,17 +188,35 @@ The GDB MCP Server provides 22 tools for controlling GDB debugging sessions:
 
 ## Usage Examples
 
-### Example 1: Analyzing a Core Dump
+### Example 1: SSH Remote Debugging
 
-**User**: "Load the core dump at /tmp/core.12345, set the sysroot to /opt/sysroot, and tell me how many threads there were when it crashed."
+**User**: "Debug the program /home/dev/myapp on server devbox, set a breakpoint at main and run."
 
 **AI Actions**:
-1. Start session with init commands:
+1. Start session with SSH parameters:
 ```json
 {
+  "program": "/home/dev/myapp",
+  "ssh_host": "devbox",
+  "ssh_user": "dev"
+}
+```
+2. Set breakpoint: `gdb_set_breakpoint` with `location="main"`
+3. Run: `gdb_execute_command` with `command="run"`
+
+### Example 2: Remote Core Dump Analysis
+
+**User**: "Load the core dump at /tmp/core.12345 on server 10.0.0.5, set the sysroot to /opt/sysroot, and tell me how many threads there were when it crashed."
+
+**AI Actions**:
+1. Start session with SSH and init commands:
+```json
+{
+  "program": "/path/to/executable",
+  "core": "/tmp/core.12345",
+  "ssh_host": "10.0.0.5",
+  "ssh_user": "root",
   "init_commands": [
-    "file /path/to/executable",
-    "core-file /tmp/core.12345",
     "set sysroot /opt/sysroot"
   ]
 }
@@ -156,7 +224,7 @@ The GDB MCP Server provides 22 tools for controlling GDB debugging sessions:
 2. Get threads: `gdb_get_threads`
 3. Report: "There were 8 threads when the program crashed."
 
-### Example 2: Conditional Breakpoint Investigation
+### Example 3: Conditional Breakpoint Investigation
 
 **User**: "Set a breakpoint at process_data but only when the count variable is greater than 100, then continue execution."
 
@@ -264,16 +332,20 @@ Always check the `warnings` field in `gdb_start_session` response! Compile your 
 
 ## How It Works
 
-1. **GDB/MI Protocol**: The server communicates with GDB using the Machine Interface (MI) protocol, the same interface used by IDEs.
+1. **GDB/MI Protocol**: The server communicates with GDB using the Machine Interface (MI) protocol, the same interface used by IDEs like VS Code and CLion.
 
-2. **pygdbmi Library**: We use the excellent `pygdbmi` library to handle the low-level protocol details and response parsing.
+2. **Built-in MI Parser**: A self-contained GDB/MI output parser handles all protocol details and response parsing — no external GDB library dependencies.
 
-3. **MCP Integration**: The server exposes GDB functionality as MCP tools, allowing AI assistants to:
+3. **Dual-Mode Process Controller**: An abstraction layer supports both local subprocess and SSH remote connections:
+   - **LocalController**: Starts GDB directly via `subprocess.Popen`
+   - **SSHController**: Starts GDB on a remote server via `ssh` subprocess, with MI protocol transparently tunneled through SSH stdin/stdout
+
+4. **MCP Integration**: The server exposes GDB functionality as MCP tools, allowing AI assistants to:
    - Understand the available debugging operations
    - Execute commands with proper parameters
    - Interpret structured responses
 
-4. **Session Management**: A single GDB session is maintained per server instance, allowing stateful debugging across multiple tool calls.
+5. **Session Management**: Multiple GDB sessions can be maintained simultaneously, allowing stateful debugging across multiple tool calls.
 
 ## Contributing
 
@@ -289,5 +361,4 @@ MIT
 ## References
 
 - [GDB Machine Interface (MI)](https://sourceware.org/gdb/current/onlinedocs/gdb/GDB_002fMI.html)
-- [pygdbmi Documentation](https://github.com/cs01/pygdbmi)
 - [Model Context Protocol](https://modelcontextprotocol.io/)

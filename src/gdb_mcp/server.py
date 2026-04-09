@@ -20,6 +20,48 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _get_ssh_defaults() -> dict[str, Any]:
+    """Read default SSH parameters from environment variables.
+
+    Environment variables:
+        GDB_SSH_HOST: Default SSH host
+        GDB_SSH_USER: Default SSH username
+        GDB_SSH_PORT: Default SSH port (default: 22)
+        GDB_SSH_KEY: Default SSH private key file path
+        GDB_SSH_OPTIONS: Default additional SSH options (comma-separated)
+
+    These can be set in the MCP client configuration's "env" block,
+    so users don't have to repeat SSH parameters in every gdb_start_session call.
+    """
+    defaults: dict[str, Any] = {}
+
+    ssh_host = os.environ.get("GDB_SSH_HOST")
+    if ssh_host:
+        defaults["ssh_host"] = ssh_host
+
+    ssh_user = os.environ.get("GDB_SSH_USER")
+    if ssh_user:
+        defaults["ssh_user"] = ssh_user
+
+    ssh_port = os.environ.get("GDB_SSH_PORT")
+    if ssh_port:
+        try:
+            defaults["ssh_port"] = int(ssh_port)
+        except ValueError:
+            logger.warning(f"Invalid GDB_SSH_PORT value: {ssh_port}, ignoring")
+
+    ssh_key = os.environ.get("GDB_SSH_KEY")
+    if ssh_key:
+        defaults["ssh_key"] = ssh_key
+
+    ssh_options = os.environ.get("GDB_SSH_OPTIONS")
+    if ssh_options:
+        # Parse comma-separated options, e.g. "-o,ProxyJump=bastion,-o,ConnectTimeout=10"
+        defaults["ssh_options"] = [opt.strip() for opt in ssh_options.split(",") if opt.strip()]
+
+    return defaults
+
+
 class SessionManager:
     """
     Manages multiple GDB debugging sessions.
@@ -104,9 +146,8 @@ class StartSessionArgs(BaseModel):
         None,
         description=(
             "Working directory to use when starting GDB. "
-            "Use this when debugging programs that need to be run from a specific directory, "
-            "or when the program expects to find files (config, data, etc.) relative to its working directory. "
-            "GDB will be started in this directory, then the original directory is restored. "
+            "In local mode: GDB is started in this directory, then the original directory is restored. "
+            "In SSH mode: cd to this directory on the remote host before starting GDB. "
             "Example: If debugging a server that loads config from './config.json', set working_dir to the server's directory."
         ),
     )
@@ -117,6 +158,43 @@ class StartSessionArgs(BaseModel):
             "When specified, GDB is started with --core flag which properly initializes symbol resolution. "
             "IMPORTANT: When using a sysroot with core dumps, set sysroot AFTER the core is loaded "
             "(either via this parameter or core-file command) for symbols to resolve correctly."
+        ),
+    )
+    ssh_host: Optional[str] = Field(
+        None,
+        description=(
+            "SSH host for remote debugging. When provided, GDB will be started on the remote "
+            "host via SSH instead of locally. Supports SSH config aliases (e.g., 'devserver'). "
+            "Default: from GDB_SSH_HOST environment variable if set."
+        ),
+    )
+    ssh_user: Optional[str] = Field(
+        None,
+        description=(
+            "SSH username for remote debugging (optional, uses SSH config default if not set). "
+            "Default: from GDB_SSH_USER environment variable if set."
+        ),
+    )
+    ssh_port: int = Field(
+        22,
+        description=(
+            "SSH port for remote debugging (default: 22). "
+            "Default: from GDB_SSH_PORT environment variable if set."
+        ),
+    )
+    ssh_key: Optional[str] = Field(
+        None,
+        description=(
+            "Path to SSH private key file for remote debugging (optional). "
+            "Default: from GDB_SSH_KEY environment variable if set."
+        ),
+    )
+    ssh_options: Optional[list[str]] = Field(
+        None,
+        description=(
+            "Additional SSH options as a list for remote debugging. "
+            "Example: ['-o', 'ProxyJump=bastion', '-o', 'ConnectTimeout=10']. "
+            "Default: from GDB_SSH_OPTIONS environment variable if set (comma-separated)."
         ),
     )
 
@@ -189,6 +267,14 @@ async def list_tools() -> list[Tool]:
             description=(
                 "Start a new GDB debugging session. Can load an executable, core dump, "
                 "or run custom initialization commands. "
+                "Supports both local and SSH remote debugging modes. "
+                "For remote debugging, provide ssh_host (and optionally ssh_user, ssh_port, "
+                "ssh_key, ssh_options) to start GDB on a remote server via SSH. "
+                "SSH parameters can also be pre-configured via environment variables "
+                "(GDB_SSH_HOST, GDB_SSH_USER, GDB_SSH_PORT, GDB_SSH_KEY, GDB_SSH_OPTIONS) "
+                "in the MCP server config - tool parameters override these defaults. "
+                "When SSH defaults are configured, you can omit SSH parameters and just provide "
+                "program/core paths to debug on the pre-configured remote server. "
                 "Automatically detects and reports important warnings such as: "
                 "missing debug symbols (not compiled with -g), file not found, or invalid executable. "
                 "Check the 'warnings' field in the response for critical issues that may affect debugging. "
@@ -196,7 +282,8 @@ async def list_tools() -> list[Tool]:
                 "core (core dump path - uses --core flag for proper symbol resolution), "
                 "init_commands (GDB commands to run after loading), "
                 "env (environment variables), gdb_path (GDB binary path), "
-                "working_dir (directory to run program from). "
+                "working_dir (directory to run program from), "
+                "ssh_host, ssh_user, ssh_port, ssh_key, ssh_options (for remote debugging). "
                 "IMPORTANT for core dump debugging: Set 'sysroot' and 'solib-search-path' AFTER "
                 "loading the core (either via 'core' parameter or 'core-file' init_command) "
                 "for symbols to resolve correctly. "
@@ -444,6 +531,21 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             if session is None:
                 raise RuntimeError(f"Failed to create session {session_id}")
 
+            # Merge SSH defaults from environment variables.
+            # Tool arguments override environment defaults.
+            ssh_defaults = _get_ssh_defaults()
+
+            ssh_host = args.ssh_host or ssh_defaults.get("ssh_host")
+            ssh_user = args.ssh_user or ssh_defaults.get("ssh_user")
+            ssh_key = args.ssh_key or ssh_defaults.get("ssh_key")
+            ssh_options = args.ssh_options or ssh_defaults.get("ssh_options")
+            # For ssh_port: use tool arg if explicitly provided (not default 22),
+            # otherwise use env default, otherwise 22.
+            if args.ssh_port != 22:
+                ssh_port = args.ssh_port
+            else:
+                ssh_port = ssh_defaults.get("ssh_port", 22)
+
             result = session.start(
                 program=args.program,
                 args=args.args,
@@ -452,6 +554,11 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
                 gdb_path=args.gdb_path,
                 working_dir=args.working_dir,
                 core=args.core,
+                ssh_host=ssh_host,
+                ssh_user=ssh_user,
+                ssh_port=ssh_port,
+                ssh_key=ssh_key,
+                ssh_options=ssh_options,
             )
             result["session_id"] = session_id
 

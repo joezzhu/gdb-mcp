@@ -4,9 +4,10 @@ import os
 import signal
 import subprocess
 import time
-from typing import Any, Optional
-from pygdbmi.gdbcontroller import GdbController
+from typing import Any, List, Optional
 import logging
+
+from .process_controller import GDBProcessController, LocalController, SSHController
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,7 @@ class GDBSession:
     """
 
     def __init__(self):
-        self.controller: Optional[GdbController] = None
+        self.controller: Optional[GDBProcessController] = None
         self.is_running = False
         self.target_loaded = False
         self.original_cwd: Optional[str] = None  # Store original working directory
@@ -46,6 +47,11 @@ class GDBSession:
         gdb_path: Optional[str] = None,
         working_dir: Optional[str] = None,
         core: Optional[str] = None,
+        ssh_host: Optional[str] = None,
+        ssh_user: Optional[str] = None,
+        ssh_port: int = 22,
+        ssh_key: Optional[str] = None,
+        ssh_options: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """
         Start a new GDB session.
@@ -56,9 +62,16 @@ class GDBSession:
             init_commands: List of GDB commands to run on startup
             env: Environment variables to set for the debugged program
             gdb_path: Path to GDB executable (default: from GDB_PATH env var or 'gdb')
-            working_dir: Working directory to use when starting GDB (changes directory
-                        before spawning GDB process, then restores it)
+            working_dir: Working directory to use when starting GDB (for local mode:
+                        changes directory before spawning GDB process, then restores it;
+                        for SSH mode: cd on remote before starting GDB)
             core: Path to core dump file (uses --core flag for proper symbol resolution)
+            ssh_host: SSH host to connect to for remote debugging. If provided, GDB
+                     will be started on the remote host via SSH.
+            ssh_user: SSH username (optional, uses SSH config default if not set)
+            ssh_port: SSH port (default: 22)
+            ssh_key: Path to SSH private key file (optional)
+            ssh_options: Additional SSH options as a list (e.g., ["-o", "ProxyJump=bastion"])
 
         Returns:
             Dict with status and any output messages
@@ -77,6 +90,11 @@ class GDBSession:
 
         Example env:
             {"LD_LIBRARY_PATH": "/custom/libs", "DEBUG_MODE": "1"}
+
+        Example SSH remote debugging:
+            ssh_host="devserver"
+            ssh_user="developer"
+            program="/home/developer/myapp"
         """
         if self.controller:
             return {"status": "error", "message": "Session already running. Stop it first."}
@@ -85,14 +103,17 @@ class GDBSession:
         if gdb_path is None:
             gdb_path = os.environ.get("GDB_PATH", "gdb")
 
-        # Save current working directory if we need to change it
-        # This will be restored when stop() is called
-        if working_dir:
+        # Determine if this is SSH mode
+        is_ssh_mode = ssh_host is not None
+
+        # Save current working directory if we need to change it (local mode only)
+        # In SSH mode, working_dir is handled by the SSHController
+        if working_dir and not is_ssh_mode:
             self.original_cwd = os.getcwd()
 
         try:
-            # Change to working directory if specified
-            if working_dir:
+            # Change to working directory if specified (local mode only)
+            if working_dir and not is_ssh_mode:
                 if not os.path.isdir(working_dir):
                     return {
                         "status": "error",
@@ -123,12 +144,27 @@ class GDBSession:
                 gdb_command.extend(["--core", core])
                 logger.info(f"Loading core dump: {core}")
 
-            # pygdbmi 0.11+ uses 'command' parameter instead of 'gdb_path' and 'gdb_args'
-            # Use 1.0s for output checking to robustly handle core files with errors/warnings
-            self.controller = GdbController(
-                command=gdb_command,
-                time_to_check_for_additional_output_sec=1.0,
-            )
+            # Create the appropriate controller
+            if is_ssh_mode:
+                logger.info(f"Using SSH mode: {ssh_user}@{ssh_host}:{ssh_port}")
+                self.controller = SSHController(
+                    ssh_host=ssh_host,
+                    gdb_command=gdb_command,
+                    ssh_user=ssh_user,
+                    ssh_port=ssh_port,
+                    ssh_key=ssh_key,
+                    ssh_options=ssh_options,
+                    working_dir=working_dir,
+                )
+            else:
+                logger.info(f"Using local mode: {' '.join(gdb_command)}")
+                self.controller = LocalController(
+                    command=gdb_command,
+                    time_to_check_for_additional_output_sec=1.0,
+                )
+
+            # Start the GDB process
+            self.controller.start()
 
             # Wait for GDB to be ready (send a no-op command and wait for result)
             # This ensures GDB has completed initialization before we send real commands
@@ -335,24 +371,7 @@ class GDBSession:
             return False
 
         try:
-            # Only check if this is a real GdbController with an actual subprocess.Popen
-            # For tests with mocks, assume the process is alive
-            if not hasattr(self.controller, "gdb_process"):
-                return True
-
-            gdb_process = self.controller.gdb_process
-
-            # Check if this is actually a subprocess.Popen instance
-            # If not (e.g., it's a Mock), assume alive to avoid breaking tests
-            if not isinstance(gdb_process, subprocess.Popen):
-                return True
-
-            # Check if process is alive by checking its return code
-            # poll() returns None if still running, or the exit code if exited
-            poll_result = gdb_process.poll()
-            if poll_result is not None:
-                logger.error(f"GDB process exited with code {poll_result}")
-            return poll_result is None
+            return self.controller.is_alive()
         except Exception as e:
             # If we can't check, assume alive to avoid false positives in tests
             logger.debug(f"Exception checking if GDB alive: {e}, assuming alive")
@@ -401,8 +420,7 @@ class GDBSession:
         # Write command to GDB without waiting for response
         # (we'll manually read until we see the prompt)
         try:
-            self.controller.io_manager.stdin.write((tokenized_command + "\n").encode())
-            self.controller.io_manager.stdin.flush()
+            self.controller.write(tokenized_command + "\n")
         except (BrokenPipeError, OSError) as e:
             logger.error(f"Failed to send command: {e}")
             return {
@@ -429,10 +447,10 @@ class GDBSession:
                     # Get the exit code for diagnostics
                     exit_code = None
                     try:
-                        if hasattr(self.controller, "gdb_process") and isinstance(
-                            self.controller.gdb_process, subprocess.Popen
+                        if hasattr(self.controller, "process") and isinstance(
+                            self.controller.process, subprocess.Popen
                         ):
-                            exit_code = self.controller.gdb_process.poll()
+                            exit_code = self.controller.process.poll()
                     except Exception:
                         pass
 
@@ -462,8 +480,8 @@ class GDBSession:
 
             try:
                 # Try to get responses with a short timeout
-                responses = self.controller.get_gdb_response(
-                    timeout_sec=POLL_TIMEOUT_SEC, raise_error_on_timeout=False
+                responses = self.controller.read_response(
+                    timeout_sec=POLL_TIMEOUT_SEC,
                 )
 
                 if not responses:
@@ -1062,7 +1080,10 @@ class GDBSession:
         """
         Interrupt (pause) a running program.
 
-        This sends SIGINT to the GDB process, which pauses the debugged program.
+        This sends an interrupt signal to GDB, which pauses the debugged program.
+        For local mode: sends SIGINT to the GDB process.
+        For SSH mode: sends -exec-interrupt MI command via the SSH tunnel.
+
         Use this when the program is running and you want to pause it to inspect
         state, set breakpoints, or perform other debugging operations.
 
@@ -1072,12 +1093,9 @@ class GDBSession:
         if not self.controller:
             return {"status": "error", "message": "No active GDB session"}
 
-        if not self.controller.gdb_process:
-            return {"status": "error", "message": "No GDB process running"}
-
         try:
-            # Send SIGINT to pause the running program
-            os.kill(self.controller.gdb_process.pid, signal.SIGINT)
+            # Send interrupt using the controller's method
+            self.controller.interrupt()
 
             # Poll for *stopped notification with timeout
             # This avoids arbitrary sleep and responds as soon as GDB confirms the stop
@@ -1086,8 +1104,8 @@ class GDBSession:
             stopped_received = False
 
             while time.time() - start_time < INTERRUPT_RESPONSE_TIMEOUT_SEC:
-                responses = self.controller.get_gdb_response(
-                    timeout_sec=POLL_TIMEOUT_SEC, raise_error_on_timeout=False
+                responses = self.controller.read_response(
+                    timeout_sec=POLL_TIMEOUT_SEC,
                 )
 
                 if responses:
@@ -1205,6 +1223,10 @@ class GDBSession:
 
         except Exception as e:
             logger.error(f"Failed to stop GDB session: {e}")
+            # Force cleanup
+            self.controller = None
+            self.is_running = False
+            self.target_loaded = False
             # Still try to restore working directory even if stop failed
             if self.original_cwd:
                 try:

@@ -2,8 +2,9 @@
 
 import os
 import pytest
-from unittest.mock import Mock, patch, MagicMock
+from unittest.mock import Mock, patch, MagicMock, PropertyMock
 from gdb_mcp.gdb_interface import GDBSession
+from gdb_mcp.process_controller import GDBProcessController, LocalController
 
 
 class TestGDBSession:
@@ -69,26 +70,25 @@ class TestGDBSession:
 
 
 class TestGDBSessionWithMock:
-    """Test cases that mock the GdbController."""
+    """Test cases that mock the GDBProcessController."""
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_start_session_already_running(self, mock_controller_class):
+    def test_start_session_already_running(self):
         """Test starting a session when one is already running."""
         session = GDBSession()
 
         # Manually set controller to simulate running session
-        session.controller = Mock()
+        session.controller = Mock(spec=GDBProcessController)
 
         result = session.start(program="/bin/ls")
 
         assert result["status"] == "error"
         assert "already running" in result["message"].lower()
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
+    @patch("gdb_mcp.gdb_interface.LocalController")
     def test_start_session_basic(self, mock_controller_class):
         """Test basic session start."""
         # Create a mock controller instance
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=LocalController)
         mock_controller_class.return_value = mock_controller
 
         session = GDBSession()
@@ -112,10 +112,10 @@ class TestGDBSessionWithMock:
         assert result["program"] == "/bin/ls"
         assert session.is_running is True
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
+    @patch("gdb_mcp.gdb_interface.LocalController")
     def test_start_session_with_custom_gdb_path(self, mock_controller_class):
         """Test session start with custom GDB path."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=LocalController)
         mock_controller_class.return_value = mock_controller
 
         session = GDBSession()
@@ -132,7 +132,7 @@ class TestGDBSessionWithMock:
         ):
             result = session.start(program="/bin/ls", gdb_path="/usr/local/bin/gdb-custom")
 
-        # Verify GdbController was called with correct command
+        # Verify LocalController was called with correct command
         call_args = mock_controller_class.call_args
         command = call_args[1]["command"]
 
@@ -140,11 +140,11 @@ class TestGDBSessionWithMock:
         assert "--interpreter=mi" in command
         assert result["status"] == "success"
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
+    @patch("gdb_mcp.gdb_interface.LocalController")
     @patch.dict(os.environ, {"GDB_PATH": "/custom/path/to/gdb"})
     def test_start_session_with_gdb_path_env_var(self, mock_controller_class):
         """Test session start uses GDB_PATH environment variable when gdb_path is not specified."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=LocalController)
         mock_controller_class.return_value = mock_controller
 
         session = GDBSession()
@@ -162,7 +162,7 @@ class TestGDBSessionWithMock:
             # Don't specify gdb_path - should use environment variable
             result = session.start(program="/bin/ls")
 
-        # Verify GdbController was called with GDB_PATH from environment
+        # Verify LocalController was called with GDB_PATH from environment
         call_args = mock_controller_class.call_args
         command = call_args[1]["command"]
 
@@ -170,11 +170,11 @@ class TestGDBSessionWithMock:
         assert "--interpreter=mi" in command
         assert result["status"] == "success"
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
+    @patch("gdb_mcp.gdb_interface.LocalController")
     @patch.dict(os.environ, {"GDB_PATH": "/env/gdb"})
     def test_start_session_explicit_path_overrides_env_var(self, mock_controller_class):
         """Test that explicit gdb_path parameter overrides GDB_PATH environment variable."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=LocalController)
         mock_controller_class.return_value = mock_controller
 
         session = GDBSession()
@@ -192,7 +192,7 @@ class TestGDBSessionWithMock:
             # Explicitly specify gdb_path - should override environment variable
             result = session.start(program="/bin/ls", gdb_path="/explicit/gdb")
 
-        # Verify GdbController was called with explicit path, not environment variable
+        # Verify LocalController was called with explicit path, not environment variable
         call_args = mock_controller_class.call_args
         command = call_args[1]["command"]
 
@@ -200,10 +200,10 @@ class TestGDBSessionWithMock:
         assert command[0] != "/env/gdb"
         assert result["status"] == "success"
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
+    @patch("gdb_mcp.gdb_interface.LocalController")
     def test_start_session_with_env_variables(self, mock_controller_class):
         """Test session start with environment variables."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=LocalController)
         mock_controller_class.return_value = mock_controller
 
         session = GDBSession()
@@ -236,10 +236,10 @@ class TestGDBSessionWithMock:
         assert any("DEBUG_MODE" in cmd for cmd in env_commands)
         assert any("LOG_LEVEL" in cmd for cmd in env_commands)
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
+    @patch("gdb_mcp.gdb_interface.LocalController")
     def test_start_session_detects_missing_debug_symbols(self, mock_controller_class):
         """Test that missing debug symbols are detected."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=LocalController)
         mock_controller_class.return_value = mock_controller
 
         session = GDBSession()
@@ -264,6 +264,45 @@ class TestGDBSessionWithMock:
         assert "warnings" in result
         assert any("not compiled with -g" in w for w in result["warnings"])
 
+    @patch("gdb_mcp.gdb_interface.SSHController")
+    def test_start_session_ssh_mode(self, mock_ssh_controller_class):
+        """Test starting a session in SSH remote mode."""
+        mock_controller = MagicMock()
+        mock_ssh_controller_class.return_value = mock_controller
+
+        session = GDBSession()
+
+        with patch.object(
+            session,
+            "_send_command_and_wait_for_prompt",
+            return_value={
+                "command_responses": [
+                    {"type": "result", "message": "done", "token": 1000},
+                ],
+                "async_notifications": [],
+                "timed_out": False,
+            },
+        ):
+            result = session.start(
+                program="/home/user/myapp",
+                ssh_host="devserver",
+                ssh_user="developer",
+                ssh_port=2222,
+                ssh_key="/home/user/.ssh/id_rsa",
+            )
+
+        assert result["status"] == "success"
+        assert result["program"] == "/home/user/myapp"
+        assert session.is_running is True
+
+        # Verify SSHController was created with correct args
+        mock_ssh_controller_class.assert_called_once()
+        call_kwargs = mock_ssh_controller_class.call_args[1]
+        assert call_kwargs["ssh_host"] == "devserver"
+        assert call_kwargs["ssh_user"] == "developer"
+        assert call_kwargs["ssh_port"] == 2222
+        assert call_kwargs["ssh_key"] == "/home/user/.ssh/id_rsa"
+
 
 class TestThreadOperations:
     """Test cases for thread inspection methods."""
@@ -277,10 +316,9 @@ class TestThreadOperations:
         result = session.get_threads()
         assert result["status"] == "error"
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_get_threads_success(self, mock_controller_class):
+    def test_get_threads_success(self):
         """Test successful thread retrieval."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -307,10 +345,9 @@ class TestThreadOperations:
         assert result["count"] == 2
         assert result["current_thread_id"] == "1"
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_select_thread(self, mock_controller_class):
+    def test_select_thread(self):
         """Test selecting a specific thread."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -333,10 +370,9 @@ class TestThreadOperations:
         assert result["thread_id"] == 2
         assert result["new_thread_id"] == "2"
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_get_backtrace_default(self, mock_controller_class):
+    def test_get_backtrace_default(self):
         """Test backtrace with default parameters."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -354,10 +390,9 @@ class TestThreadOperations:
         assert result["count"] == 1
         assert result["thread_id"] is None
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_get_backtrace_specific_thread(self, mock_controller_class):
+    def test_get_backtrace_specific_thread(self):
         """Test backtrace for a specific thread."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -383,10 +418,9 @@ class TestThreadOperations:
 class TestBreakpointOperations:
     """Test cases for breakpoint management."""
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_set_breakpoint_simple(self, mock_controller_class):
+    def test_set_breakpoint_simple(self):
         """Test setting a simple breakpoint."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -413,10 +447,9 @@ class TestBreakpointOperations:
         assert "breakpoint" in result
         assert result["breakpoint"]["func"] == "main"
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_set_breakpoint_with_condition(self, mock_controller_class):
+    def test_set_breakpoint_with_condition(self):
         """Test setting a conditional breakpoint."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -437,10 +470,9 @@ class TestBreakpointOperations:
         # Verify the command includes condition and temporary flags
         assert any("-break-insert" in cmd for cmd in commands_executed)
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_list_breakpoints(self, mock_controller_class):
+    def test_list_breakpoints(self):
         """Test listing breakpoints."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -471,11 +503,10 @@ class TestBreakpointOperations:
 class TestExecutionControl:
     """Test cases for execution control methods."""
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_continue_execution(self, mock_controller_class):
+    def test_continue_execution(self):
         """Test continue execution."""
         session = GDBSession()
-        session.controller = MagicMock()  # Just need a controller object
+        session.controller = MagicMock(spec=GDBProcessController)
         session.is_running = True
 
         # Mock execute_command since continue_execution now just calls it
@@ -492,11 +523,10 @@ class TestExecutionControl:
         assert result["status"] == "success"
         mock_execute.assert_called_once_with("-exec-continue")
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_step(self, mock_controller_class):
+    def test_step(self):
         """Test step into."""
         session = GDBSession()
-        session.controller = MagicMock()  # Just need a controller object
+        session.controller = MagicMock(spec=GDBProcessController)
         session.is_running = True
 
         # Mock execute_command since step now just calls it
@@ -513,11 +543,10 @@ class TestExecutionControl:
         assert result["status"] == "success"
         mock_execute.assert_called_once_with("-exec-step")
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_next(self, mock_controller_class):
+    def test_next(self):
         """Test step over."""
         session = GDBSession()
-        session.controller = MagicMock()  # Just need a controller object
+        session.controller = MagicMock(spec=GDBProcessController)
         session.is_running = True
 
         # Mock execute_command since next now just calls it
@@ -542,14 +571,11 @@ class TestExecutionControl:
         assert result["status"] == "error"
         assert "No active GDB session" in result["message"]
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    @patch("gdb_mcp.gdb_interface.os.kill")
-    def test_interrupt_success(self, mock_kill, mock_controller_class):
+    def test_interrupt_success(self):
         """Test successful interrupt with stopped notification."""
-        mock_controller = MagicMock()
-        mock_controller.gdb_process.pid = 12345
+        mock_controller = MagicMock(spec=GDBProcessController)
         # Return the *stopped notification in GDB/MI format
-        mock_controller.get_gdb_response.return_value = [
+        mock_controller.read_response.return_value = [
             {"type": "notify", "message": "stopped", "payload": {"reason": "signal-received"}}
         ]
 
@@ -561,16 +587,13 @@ class TestExecutionControl:
 
         assert result["status"] == "success"
         assert "interrupted" in result["message"].lower()
-        mock_kill.assert_called_once()
+        mock_controller.interrupt.assert_called_once()
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    @patch("gdb_mcp.gdb_interface.os.kill")
-    def test_interrupt_no_stopped_notification(self, mock_kill, mock_controller_class):
+    def test_interrupt_no_stopped_notification(self):
         """Test interrupt when no stopped notification is received."""
-        mock_controller = MagicMock()
-        mock_controller.gdb_process.pid = 12345
+        mock_controller = MagicMock(spec=GDBProcessController)
         # Return empty responses (no stopped notification)
-        mock_controller.get_gdb_response.return_value = []
+        mock_controller.read_response.return_value = []
 
         session = GDBSession()
         session.controller = mock_controller
@@ -581,16 +604,15 @@ class TestExecutionControl:
         # Should return warning status when no stopped notification received
         assert result["status"] == "warning"
         assert "no stopped notification" in result["message"].lower()
-        mock_kill.assert_called_once()
+        mock_controller.interrupt.assert_called_once()
 
 
 class TestDataInspection:
     """Test cases for data inspection methods."""
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_evaluate_expression(self, mock_controller_class):
+    def test_evaluate_expression(self):
         """Test expression evaluation."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -608,10 +630,9 @@ class TestDataInspection:
         assert result["expression"] == "x + y"
         assert result["value"] == "42"
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_get_variables(self, mock_controller_class):
+    def test_get_variables(self):
         """Test getting local variables."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -639,10 +660,9 @@ class TestDataInspection:
         assert result["frame"] == 1
         assert len(result["variables"]) == 2
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_get_registers(self, mock_controller_class):
+    def test_get_registers(self):
         """Test getting register values."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -670,10 +690,9 @@ class TestDataInspection:
 class TestSessionManagement:
     """Test cases for session management operations."""
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_stop_active_session(self, mock_controller_class):
+    def test_stop_active_session(self):
         """Test stopping an active session."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -684,11 +703,10 @@ class TestSessionManagement:
         assert session.controller is None
         assert session.is_running is False
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_execute_command_cli(self, mock_controller_class):
+    def test_execute_command_cli(self):
         """Test executing a CLI command with active session."""
         session = GDBSession()
-        session.controller = MagicMock()  # Just need a controller object
+        session.controller = MagicMock(spec=GDBProcessController)
         session.is_running = True
 
         # Mock the internal send_command method
@@ -709,11 +727,10 @@ class TestSessionManagement:
         assert result["status"] == "success"
         assert "Thread 1" in result["output"]
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_execute_command_mi(self, mock_controller_class):
+    def test_execute_command_mi(self):
         """Test executing an MI command with active session."""
         session = GDBSession()
-        session.controller = MagicMock()  # Just need a controller object
+        session.controller = MagicMock(spec=GDBProcessController)
         session.is_running = True
 
         # Mock the internal send_command method
@@ -737,7 +754,7 @@ class TestSessionManagement:
 class TestErrorHandling:
     """Test cases for error handling."""
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
+    @patch("gdb_mcp.gdb_interface.LocalController")
     def test_start_session_exception(self, mock_controller_class):
         """Test that start handles exceptions gracefully."""
         mock_controller_class.side_effect = Exception("GDB not found")
@@ -748,11 +765,10 @@ class TestErrorHandling:
         assert result["status"] == "error"
         assert "GDB not found" in result["message"]
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_execute_command_exception(self, mock_controller_class):
+    def test_execute_command_exception(self):
         """Test that execute_command handles errors."""
         session = GDBSession()
-        session.controller = MagicMock()
+        session.controller = MagicMock(spec=GDBProcessController)
         session.is_running = True
 
         # Mock _send_command_and_wait_for_prompt to return error
@@ -771,10 +787,9 @@ class TestErrorHandling:
         assert result["status"] == "error"
         assert "Timeout" in result["message"]
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_set_breakpoint_no_result(self, mock_controller_class):
+    def test_set_breakpoint_no_result(self):
         """Test set_breakpoint when GDB returns no result."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -788,10 +803,9 @@ class TestErrorHandling:
         assert result["status"] == "error"
         assert "no result from GDB" in result["message"]
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_gdb_internal_fatal_error(self, mock_controller_class):
+    def test_gdb_internal_fatal_error(self):
         """Test that GDB internal fatal errors are detected and session is stopped."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -815,10 +829,9 @@ class TestErrorHandling:
         assert "internal" in result["message"].lower()
         assert result.get("fatal") is True
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_gdb_fatal_error_message_format(self, mock_controller_class):
+    def test_gdb_fatal_error_message_format(self):
         """Test detection of 'A fatal error internal to GDB' message format."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=GDBProcessController)
         session = GDBSession()
         session.controller = mock_controller
         session.is_running = True
@@ -842,10 +855,10 @@ class TestErrorHandling:
         assert "fatal" in result["message"].lower()
         assert result.get("fatal") is True
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
+    @patch("gdb_mcp.gdb_interface.LocalController")
     def test_fatal_error_during_initialization(self, mock_controller_class):
         """Test that fatal errors during GDB initialization are handled properly."""
-        mock_controller = MagicMock()
+        mock_controller = MagicMock(spec=LocalController)
         mock_controller_class.return_value = mock_controller
 
         session = GDBSession()
@@ -882,11 +895,10 @@ class TestCallFunction:
         assert result["status"] == "error"
         assert "No active GDB session" in result["message"]
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_call_function_success(self, mock_controller_class):
+    def test_call_function_success(self):
         """Test successful function call execution."""
         session = GDBSession()
-        session.controller = MagicMock()
+        session.controller = MagicMock(spec=GDBProcessController)
         session.is_running = True
 
         with patch.object(
@@ -907,11 +919,10 @@ class TestCallFunction:
         assert result["function_call"] == 'strlen("hello")'
         assert "$1 = 5" in result["result"]
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_call_function_timeout(self, mock_controller_class):
+    def test_call_function_timeout(self):
         """Test call_function when command times out."""
         session = GDBSession()
-        session.controller = MagicMock()
+        session.controller = MagicMock(spec=GDBProcessController)
         session.is_running = True
 
         with patch.object(
@@ -928,11 +939,10 @@ class TestCallFunction:
         assert result["status"] == "error"
         assert "Timeout" in result["message"]
 
-    @patch("gdb_mcp.gdb_interface.GdbController")
-    def test_call_function_error(self, mock_controller_class):
+    def test_call_function_error(self):
         """Test call_function when there's an error."""
         session = GDBSession()
-        session.controller = MagicMock()
+        session.controller = MagicMock(spec=GDBProcessController)
         session.is_running = True
 
         with patch.object(

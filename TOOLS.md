@@ -15,6 +15,11 @@ Start a new GDB debugging session.
 - `env` (optional): Environment variables to set for the debugged program (dictionary of name-value pairs)
 - `gdb_path` (optional): Path to GDB executable (default: "gdb")
 - `working_dir` (optional): Working directory to use when starting GDB
+- `ssh_host` (optional): SSH host for remote debugging. When provided, GDB is started on the remote host via SSH
+- `ssh_user` (optional): SSH username (uses SSH config default if not set)
+- `ssh_port` (optional): SSH port (default: 22)
+- `ssh_key` (optional): Path to SSH private key file
+- `ssh_options` (optional): Additional SSH options as a list (e.g., `["-o", "ProxyJump=bastion"]`)
 
 **Returns:**
 - `status`: "success" or "error"
@@ -64,6 +69,41 @@ If using `core-file` in init_commands instead of the `core` parameter, ensure it
 ```
 
 Use `gdb_path` when you need to use a specific GDB version or when GDB is not in your PATH.
+
+**Example SSH remote debugging:**
+```json
+{
+  "program": "/home/user/myapp",
+  "ssh_host": "devserver",
+  "ssh_user": "developer",
+  "ssh_port": 22
+}
+```
+
+**Example SSH remote core dump analysis:**
+```json
+{
+  "program": "/path/to/executable",
+  "core": "/path/to/core.dump",
+  "ssh_host": "debug-server",
+  "ssh_user": "root",
+  "ssh_key": "/home/user/.ssh/id_rsa",
+  "init_commands": [
+    "set sysroot /path/to/sysroot",
+    "set solib-search-path /path/to/libs"
+  ]
+}
+```
+
+SSH parameters connect the MCP Server (running locally) to a remote GDB instance via SSH. The remote server only needs GDB installed — no Python or MCP deployment needed.
+
+**SSH defaults via environment variables:**
+
+SSH parameters can be pre-configured in the MCP server's `env` config block so you don't need to repeat them in every call. Set `GDB_SSH_HOST`, `GDB_SSH_USER`, `GDB_SSH_PORT`, `GDB_SSH_KEY`, or `GDB_SSH_OPTIONS` (comma-separated). Tool parameters always override these defaults. When defaults are configured, a simple call with just `program`/`core` will automatically use SSH:
+
+```json
+{"program": "/home/user/myapp", "core": "/home/user/core.12345"}
+```
 
 **Example with environment variables:**
 ```json

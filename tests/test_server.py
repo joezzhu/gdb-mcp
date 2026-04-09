@@ -26,6 +26,12 @@ class TestStartSessionArgs:
         assert (
             args.gdb_path is None
         )  # Default to None, actual default determined by GDB_PATH env var or "gdb"
+        # SSH defaults
+        assert args.ssh_host is None
+        assert args.ssh_user is None
+        assert args.ssh_port == 22
+        assert args.ssh_key is None
+        assert args.ssh_options is None
 
     def test_full_args(self):
         """Test creating StartSessionArgs with all arguments."""
@@ -42,6 +48,23 @@ class TestStartSessionArgs:
         assert args.init_commands == ["set pagination off"]
         assert args.env == {"DEBUG": "1"}
         assert args.gdb_path == "/usr/local/bin/gdb"
+
+    def test_ssh_args(self):
+        """Test creating StartSessionArgs with SSH parameters."""
+        args = StartSessionArgs(
+            program="/home/user/myapp",
+            ssh_host="devserver",
+            ssh_user="developer",
+            ssh_port=2222,
+            ssh_key="/home/user/.ssh/id_rsa",
+            ssh_options=["-o", "ProxyJump=bastion"],
+        )
+
+        assert args.ssh_host == "devserver"
+        assert args.ssh_user == "developer"
+        assert args.ssh_port == 2222
+        assert args.ssh_key == "/home/user/.ssh/id_rsa"
+        assert args.ssh_options == ["-o", "ProxyJump=bastion"]
 
     def test_env_dict_validation(self):
         """Test that env accepts dictionary of strings."""

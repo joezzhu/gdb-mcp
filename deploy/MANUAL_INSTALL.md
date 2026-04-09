@@ -1,188 +1,103 @@
-# GDB MCP Server 手动安装指南
+# GDB MCP Server 安装部署指南
 
-本文档提供从零开始在 Linux 服务器上手动部署 GDB MCP Server 的完整步骤，适用于远程 coredump 调试场景。
+本文档提供 GDB MCP Server 的完整安装步骤。
 
----
-
-## 第 1 步：安装 GDB
-
-```bash
-# Ubuntu/Debian
-sudo apt update && sudo apt install -y gdb
-
-# CentOS/RHEL/TencentOS
-sudo yum install -y gdb
-# 或
-sudo dnf install -y gdb
-
-# 验证
-gdb --version
-```
-
-如果需要调试 ARM 等非本机架构的 coredump：
-```bash
-# Ubuntu/Debian
-sudo apt install -y gdb-multiarch
-
-# CentOS/RHEL（可能需要 EPEL 源）
-sudo yum install -y gdb-multiarch
-```
+> **v0.2.0 架构变更**：MCP Server 现在运行在**本地**，通过 SSH 连接远端 GDB。远端服务器只需要安装 GDB，不再需要部署 Python 环境或 MCP Server。
 
 ---
 
-## 第 2 步：安装 Python 3.10+
+## 架构概览
 
-> **GDB MCP Server 要求 Python >= 3.10。** 许多 Linux 发行版（如 CentOS 7/8、TencentOS）自带的 Python 是 3.6/3.8，版本不够，需要额外安装。
-
-先检查当前版本：
-```bash
-python3 --version
 ```
-
-如果已经 >= 3.10，跳到第 3 步。否则按以下方式安装。
-
-### 方式 A：从系统包管理器安装（推荐）
-
-```bash
-# ---- Ubuntu 22.04+ ----
-# 自带 Python 3.10+，无需额外安装
-sudo apt install -y python3 python3-venv python3-pip
-
-# ---- Ubuntu 20.04 ----
-sudo apt update
-sudo apt install -y software-properties-common
-sudo add-apt-repository -y ppa:deadsnakes/ppa
-sudo apt install -y python3.11 python3.11-venv python3.11-dev
-
-# ---- CentOS 8 / CentOS Stream / TencentOS 3.1+ ----
-sudo dnf install -y python3.11
-# 或
-sudo dnf install -y python3.10
-
-# ---- CentOS 7 ----
-# 需要启用 SCL 或 EPEL
-sudo yum install -y centos-release-scl
-sudo yum install -y rh-python38  # CentOS 7 最高到 3.8，建议升级系统或用源码编译
+┌─────────────────────┐                    ┌──────────────────────────────┐
+│  MCP Client          │                    │    远程 Linux 服务器           │
+│  (Claude Desktop /   │                    │                              │
+│   CodeBuddy IDE)     │     stdio          │  只需要：                     │
+│                      │ ◄──────────►       │  ✓ GDB 已安装                │
+│                      │                    │  ✓ SSH 可访问                 │
+│  ┌────────────────┐  │     SSH            │  ✗ 不需要 Python             │
+│  │ MCP Server     │──│─────────────────►  │  ✗ 不需要 MCP Server         │
+│  │ (本地 Python)   │  │                    │                              │
+│  │ ├─ MI Parser   │  │                    │  ┌────────────────────────┐  │
+│  │ └─ SSH Ctrl    │  │                    │  │  GDB --interpreter=mi  │  │
+│  └────────────────┘  │                    │  │  ├── executable         │  │
+│                      │                    │  │  ├── coredump          │  │
+│                      │                    │  │  └── sysroot           │  │
+└─────────────────────┘                    │  └────────────────────────┘  │
+                                           └──────────────────────────────┘
 ```
-
-安装后验证：
-```bash
-python3.11 --version   # 或 python3.10 --version
-```
-
-### 方式 B：从源码编译安装
-
-适用于系统包管理器中没有 Python 3.10+ 的情况。
-
-```bash
-# 1. 安装编译依赖
-# Ubuntu/Debian
-sudo apt install -y build-essential zlib1g-dev libncurses5-dev \
-    libgdbm-dev libnss3-dev libssl-dev libreadline-dev libffi-dev \
-    libsqlite3-dev wget libbz2-dev
-
-# CentOS/RHEL/TencentOS
-sudo yum groupinstall -y "Development Tools"
-sudo yum install -y gcc openssl-devel bzip2-devel libffi-devel \
-    zlib-devel readline-devel sqlite-devel wget
-
-# 2. 下载 Python 源码
-cd /tmp
-wget https://www.python.org/ftp/python/3.11.9/Python-3.11.9.tgz
-tar xzf Python-3.11.9.tgz
-cd Python-3.11.9
-
-# 3. 编译安装
-./configure --enable-optimizations --prefix=/usr/local
-make -j$(nproc)
-sudo make altinstall    # 重要：用 altinstall，不会覆盖系统自带的 python3
-
-# 4. 验证
-/usr/local/bin/python3.11 --version
-# 输出: Python 3.11.9
-```
-
-> **⚠️ 注意**：务必使用 `make altinstall` 而不是 `make install`，否则会覆盖系统的 `python3` 命令，可能导致 `dnf`/`yum` 等系统工具异常。
 
 ---
 
-## 第 3 步：获取 GDB MCP Server 源码
+## 第 1 步：本地安装 MCP Server
+
+### 前置条件
+
+- **本地机器**：Python 3.10+、SSH 客户端
+- **远程服务器**：GDB 已安装、SSH 可访问
+
+### 安装
 
 ```bash
-# 方式 1：git clone
+# 克隆项目
 git clone <repository-url> ~/gdb-mcp
 cd ~/gdb-mcp
 
-# 方式 2：scp 从本地传输
-# （在本地执行）
-scp -r /path/to/gdb-mcp user@remote-server:~/gdb-mcp
-```
+# 方式 A：使用 pipx（推荐）
+pipx install .
 
----
-
-## 第 4 步：创建 Python 虚拟环境并安装
-
-根据你安装的 Python 版本，选择对应的命令（以下以 `python3.11` 为例）：
-
-```bash
-cd ~/gdb-mcp
-
-# 创建虚拟环境（使用你安装的高版本 Python）
-python3.11 -m venv venv
-# 如果是源码编译的：
-# /usr/local/bin/python3.11 -m venv venv
-
-# 激活虚拟环境
-source venv/bin/activate
-
-# 确认 Python 版本
-python --version
-# 输出: Python 3.11.x
-
-# 升级 pip
-pip install --upgrade pip
-
-# 安装 gdb-mcp-server
+# 方式 B：使用虚拟环境
+python3 -m venv venv
+source venv/bin/activate  # Linux/macOS
 pip install -e .
 ```
 
-安装完成后验证：
+验证安装：
 ```bash
-# 确认模块可导入
-python -c "import gdb_mcp; print(f'gdb-mcp-server v{gdb_mcp.__version__} OK')"
+# pipx 方式
+gdb-mcp-server  # Ctrl+C 退出
 
-# 确认依赖完整
-python -c "import mcp; import pygdbmi; print('dependencies OK')"
-
-# 启动测试（Ctrl+C 退出）
-python -m gdb_mcp
+# venv 方式
+python -m gdb_mcp  # Ctrl+C 退出
 # 应输出: INFO:gdb_mcp.server:GDB MCP Server starting...
-```
-
-退出虚拟环境：
-```bash
-deactivate
 ```
 
 ---
 
-## 第 5 步：配置本地 SSH 免密登录
-
-在你的**本地机器**上操作：
+## 第 2 步：确保远程服务器有 GDB
 
 ```bash
-# 生成 SSH 密钥（如果没有）
-ssh-keygen -t ed25519 -C "gdb-mcp"
+# 在远程服务器上
+ssh user@remote-server
 
-# 复制公钥到远程服务器
-ssh-copy-id user@remote-server
+# 检查 GDB
+gdb --version
 
-# 验证免密登录
-ssh user@remote-server "echo OK"
+# 如果没有安装
+sudo apt install -y gdb           # Ubuntu/Debian
+sudo yum install -y gdb           # CentOS/RHEL
+sudo dnf install -y gdb           # Fedora
+
+# 跨架构调试（ARM coredump 等）
+sudo apt install -y gdb-multiarch
 ```
 
-（可选）在本地 `~/.ssh/config` 中添加别名，简化后续配置：
+**就这些！** 远端不需要安装 Python、不需要部署 MCP Server。
 
+---
+
+## 第 3 步：配置 SSH 免密登录
+
+```bash
+# 在本地机器上
+ssh-keygen -t ed25519 -C "gdb-mcp"
+ssh-copy-id user@remote-server
+
+# 验证
+ssh user@remote-server "echo OK && gdb --version"
+```
+
+（可选）配置 SSH 别名 `~/.ssh/config`：
 ```
 Host gdb-remote
     HostName 远程服务器IP
@@ -190,68 +105,48 @@ Host gdb-remote
     Port 22
     IdentityFile ~/.ssh/id_ed25519
     ServerAliveInterval 60
-    ServerAliveCountMax 3
 ```
 
 ---
 
-## 第 6 步：验证远程 SSH 启动
-
-在**本地**终端执行：
-
-```bash
-# 用绝对路径通过 SSH 启动 MCP server
-ssh user@remote-server "~/gdb-mcp/venv/bin/python -m gdb_mcp"
-# 应看到: INFO:gdb_mcp.server:GDB MCP Server starting...
-# Ctrl+C 退出
-```
-
-如果看到正常输出，说明远程环境已就绪。
-
----
-
-## 第 7 步：配置 MCP 客户端
-
-在你的 MCP 客户端（Claude Desktop / CodeBuddy IDE）中添加配置。
+## 第 4 步：配置 MCP 客户端
 
 ### Claude Desktop
 
-编辑配置文件（位置见下方），添加 `gdb-remote`：
+编辑配置文件：
 - **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Linux**: `~/.config/Claude/claude_desktop_config.json`
 - **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
 
+**基础配置**（每次调用时传 SSH 参数）：
 ```json
 {
   "mcpServers": {
-    "gdb-remote": {
-      "command": "ssh",
-      "args": [
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "BatchMode=yes",
-        "user@remote-server",
-        "/home/user/gdb-mcp/venv/bin/python", "-m", "gdb_mcp"
-      ]
+    "gdb": {
+      "command": "gdb-mcp-server"
     }
   }
 }
 ```
 
-如果配置了 SSH 别名，可简化为：
-
+**推荐配置**（预设 SSH 默认参数，调用时无需重复传递）：
 ```json
 {
   "mcpServers": {
-    "gdb-remote": {
-      "command": "ssh",
-      "args": [
-        "gdb-remote",
-        "/home/user/gdb-mcp/venv/bin/python", "-m", "gdb_mcp"
-      ]
+    "gdb": {
+      "command": "gdb-mcp-server",
+      "env": {
+        "GDB_SSH_HOST": "远程服务器IP",
+        "GDB_SSH_USER": "你的用户名",
+        "GDB_SSH_PORT": "22",
+        "GDB_SSH_KEY": "SSH私钥路径"
+      }
     }
   }
 }
 ```
+
+配置 SSH 环境变量后，AI 只需提供 `program`/`core` 路径即可自动走 SSH 远程调试，无需每次传递 SSH 参数。
 
 ### CodeBuddy IDE
 
@@ -259,74 +154,109 @@ ssh user@remote-server "~/gdb-mcp/venv/bin/python -m gdb_mcp"
 
 ---
 
-## 第 8 步：开始调试 Coredump
+## 第 5 步：开始远程调试
 
 在 MCP 客户端中向 AI 发送：
 
 ```
-请加载远程服务器上的 coredump 进行分析：
-- 可执行文件：/path/to/my_program
-- Core 文件：/path/to/core.12345
-
-请告诉我崩溃原因和所有线程的状态。
+请调试远程服务器 devbox 上的 /home/dev/myapp，在 main 处设断点并运行。
 ```
 
-带 sysroot 的场景：
+AI 将自动使用 SSH 参数调用 `gdb_start_session`：
+```json
+{
+  "program": "/home/dev/myapp",
+  "ssh_host": "devbox",
+  "ssh_user": "dev"
+}
+```
+
+### 远程 Coredump 分析
 
 ```
-分析 coredump：
-- 可执行文件：/data/debug/executables/my_server
-- Core 文件：/data/debug/coredumps/core.99999
+分析远程服务器 10.0.0.5 上的 coredump：
+- 可执行文件：/data/debug/my_server
+- Core 文件：/data/debug/core.12345
 - Sysroot：/data/debug/sysroot
-- 库路径：/data/debug/sysroot/usr/lib:/data/debug/sysroot/lib
+```
+
+AI 将使用：
+```json
+{
+  "program": "/data/debug/my_server",
+  "core": "/data/debug/core.12345",
+  "ssh_host": "10.0.0.5",
+  "ssh_user": "root",
+  "init_commands": [
+    "set sysroot /data/debug/sysroot"
+  ]
+}
+```
+
+---
+
+## 本地模式（无 SSH）
+
+不提供 SSH 参数时，MCP Server 直接启动本地 GDB，行为与之前完全一致：
+
+```json
+{
+  "program": "/path/to/local/app"
+}
+```
+
+---
+
+## SSH 连接参数说明
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `ssh_host` | SSH 主机（IP 或 SSH config 别名） | 无（不传则走本地模式） |
+| `ssh_user` | SSH 用户名 | 使用 SSH config 默认值 |
+| `ssh_port` | SSH 端口 | 22 |
+| `ssh_key` | SSH 私钥文件路径 | 使用 SSH agent 或默认密钥 |
+| `ssh_options` | 额外 SSH 选项列表 | 无 |
+
+`ssh_options` 示例：
+```json
+{
+  "ssh_options": ["-o", "ProxyJump=bastion", "-o", "ConnectTimeout=10"]
+}
 ```
 
 ---
 
 ## 常见问题
 
-### Q: `pip install -e .` 报 `No matching distribution found for mcp>=0.9.0`
-**原因**：Python 版本低于 3.10，`mcp` 包不支持。
-**解决**：确认 venv 使用的是 Python 3.10+：
+### Q: SSH 连接超时
 ```bash
-~/gdb-mcp/venv/bin/python --version
-```
-如果不是，删除旧 venv 重新创建：
-```bash
-rm -rf ~/gdb-mcp/venv
-python3.11 -m venv ~/gdb-mcp/venv
-source ~/gdb-mcp/venv/bin/activate
-pip install -e .
+ssh -vvv user@remote-server  # 详细调试
+ssh-add -l                    # 确认 key 已加载
 ```
 
-### Q: `python3.11 -m venv venv` 报 `No module named venv`
-**解决**：
-```bash
-# Ubuntu/Debian
-sudo apt install -y python3.11-venv
-
-# CentOS/RHEL（源码编译的通常自带 venv，无需额外安装）
+### Q: 远端 GDB 版本太旧
+使用 `gdb_path` 参数指定远端的 GDB 路径：
+```json
+{
+  "ssh_host": "server",
+  "gdb_path": "/opt/gdb-13/bin/gdb"
+}
 ```
 
-### Q: 源码编译时 `./configure` 报缺少 openssl
-**解决**：
-```bash
-# Ubuntu/Debian
-sudo apt install -y libssl-dev
-
-# CentOS/RHEL
-sudo yum install -y openssl-devel
+### Q: 跨架构调试 ARM coredump
+在远端安装 `gdb-multiarch`，然后：
+```json
+{
+  "ssh_host": "server",
+  "gdb_path": "/usr/bin/gdb-multiarch"
+}
 ```
 
-### Q: SSH 启动后无输出或报错 `ModuleNotFoundError`
-**解决**：确认 SSH 命令中使用的是 venv 的**绝对路径**：
-```bash
-# 正确 ✓
-ssh user@server "/home/user/gdb-mcp/venv/bin/python -m gdb_mcp"
-
-# 错误 ✗（系统 python 没有装 gdb_mcp）
-ssh user@server "python3 -m gdb_mcp"
+### Q: 需要通过跳板机连接
+使用 `ssh_options` 或配置 SSH config 中的 `ProxyJump`：
+```json
+{
+  "ssh_host": "target-server",
+  "ssh_options": ["-o", "ProxyJump=bastion-host"]
+}
 ```
-
-### Q: 不想覆盖系统 Python，安装了 python3.11 但 `python3` 还是 3.8
-**说明**：这是正常的。不要修改系统默认 `python3`，直接用 `python3.11` 命令即可。venv 激活后或使用绝对路径时，都是 3.11。
