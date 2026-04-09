@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 import threading
 from typing import Any, Optional
 from mcp.server import Server
@@ -18,6 +19,11 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Session timeout: default 30 minutes (in seconds)
+DEFAULT_SESSION_TIMEOUT_SEC = 30 * 60
+# How often to check for expired sessions (in seconds)
+SESSION_CLEANUP_INTERVAL_SEC = 60
 
 
 def _get_ssh_defaults() -> dict[str, Any]:
@@ -64,17 +70,94 @@ def _get_ssh_defaults() -> dict[str, Any]:
 
 class SessionManager:
     """
-    Manages multiple GDB debugging sessions.
+    Manages multiple GDB debugging sessions with idle timeout support.
 
     Thread-safe session management with simple integer session IDs.
     Sessions are created, retrieved by ID, and explicitly removed.
+    Idle sessions are automatically stopped and cleaned up after a configurable timeout.
     """
 
     def __init__(self):
         """Initialize the session manager with empty session storage."""
         self._sessions: dict[int, GDBSession] = {}
+        self._last_active: dict[int, float] = {}  # session_id -> last activity timestamp
+        self._expired_sessions: dict[int, float] = {}  # session_id -> expiry timestamp (for error messages)
         self._next_session_id: int = 1
         self._lock = threading.Lock()
+        self._cleanup_timer: Optional[threading.Timer] = None
+        self._shutdown = False
+
+        # Read timeout from environment variable
+        timeout_str = os.environ.get("GDB_SESSION_TIMEOUT")
+        if timeout_str:
+            try:
+                self._timeout_sec = int(timeout_str)
+                if self._timeout_sec <= 0:
+                    logger.warning(f"GDB_SESSION_TIMEOUT must be positive, using default")
+                    self._timeout_sec = DEFAULT_SESSION_TIMEOUT_SEC
+            except ValueError:
+                logger.warning(f"Invalid GDB_SESSION_TIMEOUT value: {timeout_str}, using default")
+                self._timeout_sec = DEFAULT_SESSION_TIMEOUT_SEC
+        else:
+            self._timeout_sec = DEFAULT_SESSION_TIMEOUT_SEC
+
+        logger.info(f"Session idle timeout: {self._timeout_sec}s ({self._timeout_sec // 60}min)")
+
+        # Start the cleanup timer
+        self._schedule_cleanup()
+
+    def _schedule_cleanup(self) -> None:
+        """Schedule the next cleanup check."""
+        if self._shutdown:
+            return
+        self._cleanup_timer = threading.Timer(SESSION_CLEANUP_INTERVAL_SEC, self._cleanup_expired)
+        self._cleanup_timer.daemon = True  # Don't block process exit
+        self._cleanup_timer.start()
+
+    def _cleanup_expired(self) -> None:
+        """Check for and clean up expired sessions."""
+        if self._shutdown:
+            return
+
+        now = time.time()
+        expired_ids: list[int] = []
+
+        with self._lock:
+            for session_id, last_active in self._last_active.items():
+                idle_sec = now - last_active
+                if idle_sec >= self._timeout_sec:
+                    expired_ids.append(session_id)
+
+        # Stop expired sessions outside the lock to avoid deadlock
+        for session_id in expired_ids:
+            idle_min = (now - self._last_active.get(session_id, now)) / 60
+            logger.info(
+                f"Session {session_id} expired after {idle_min:.1f}min idle "
+                f"(timeout: {self._timeout_sec // 60}min). Stopping..."
+            )
+            try:
+                session = self.get_session(session_id)
+                if session:
+                    session.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping expired session {session_id}: {e}")
+
+            with self._lock:
+                self._sessions.pop(session_id, None)
+                self._expired_sessions[session_id] = now
+                self._last_active.pop(session_id, None)
+
+            logger.info(f"Session {session_id} cleaned up due to idle timeout")
+
+        # Limit expired_sessions history to last 100 entries
+        with self._lock:
+            if len(self._expired_sessions) > 100:
+                oldest_keys = sorted(self._expired_sessions, key=self._expired_sessions.get)[:50]
+                for k in oldest_keys:
+                    del self._expired_sessions[k]
+
+        # Schedule the next check
+        self._schedule_cleanup()
 
     def create_session(self) -> int:
         """
@@ -87,6 +170,7 @@ class SessionManager:
             session_id = self._next_session_id
             self._next_session_id += 1
             self._sessions[session_id] = GDBSession()
+            self._last_active[session_id] = time.time()
         return session_id
 
     def get_session(self, session_id: int) -> Optional[GDBSession]:
@@ -102,6 +186,28 @@ class SessionManager:
         with self._lock:
             return self._sessions.get(session_id)
 
+    def touch_session(self, session_id: int) -> None:
+        """Update the last activity timestamp for a session.
+
+        Args:
+            session_id: The session ID to refresh
+        """
+        with self._lock:
+            if session_id in self._sessions:
+                self._last_active[session_id] = time.time()
+
+    def was_expired(self, session_id: int) -> bool:
+        """Check if a session was previously expired due to idle timeout.
+
+        Args:
+            session_id: The session ID to check
+
+        Returns:
+            True if the session was expired by timeout, False otherwise
+        """
+        with self._lock:
+            return session_id in self._expired_sessions
+
     def remove_session(self, session_id: int) -> bool:
         """
         Remove a GDB session by its ID.
@@ -115,8 +221,32 @@ class SessionManager:
         with self._lock:
             if session_id in self._sessions:
                 del self._sessions[session_id]
+                self._last_active.pop(session_id, None)
                 return True
             return False
+
+    def shutdown(self) -> None:
+        """Stop the cleanup timer and clean up all sessions."""
+        self._shutdown = True
+        if self._cleanup_timer:
+            self._cleanup_timer.cancel()
+            self._cleanup_timer = None
+
+        # Stop all active sessions
+        with self._lock:
+            session_ids = list(self._sessions.keys())
+
+        for sid in session_ids:
+            try:
+                session = self.get_session(sid)
+                if session:
+                    session.stop()
+            except Exception as e:
+                logger.warning(f"Error stopping session {sid} during shutdown: {e}")
+
+        with self._lock:
+            self._sessions.clear()
+            self._last_active.clear()
 
 
 # Global session manager instance
@@ -567,94 +697,109 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
             session = session_manager.get_session(session_id)
 
             if session is None:
-                result = {
-                    "status": "error",
-                    "message": f"Invalid session_id: {session_id}. Use gdb_start_session to create a new session.",
-                }
-            elif name == "gdb_execute_command":
-                exec_args: ExecuteCommandArgs = ExecuteCommandArgs(**arguments)
-                result = session.execute_command(command=exec_args.command)
-
-            elif name == "gdb_get_status":
-                result = session.get_status()
-
-            elif name == "gdb_get_threads":
-                result = session.get_threads()
-
-            elif name == "gdb_select_thread":
-                thread_args: ThreadSelectArgs = ThreadSelectArgs(**arguments)
-                result = session.select_thread(thread_id=thread_args.thread_id)
-
-            elif name == "gdb_get_backtrace":
-                backtrace_args: GetBacktraceArgs = GetBacktraceArgs(**arguments)
-                result = session.get_backtrace(
-                    thread_id=backtrace_args.thread_id,
-                    max_frames=backtrace_args.max_frames,
-                )
-
-            elif name == "gdb_select_frame":
-                frame_args: FrameSelectArgs = FrameSelectArgs(**arguments)
-                result = session.select_frame(frame_number=frame_args.frame_number)
-
-            elif name == "gdb_get_frame_info":
-                result = session.get_frame_info()
-
-            elif name == "gdb_set_breakpoint":
-                bp_args: SetBreakpointArgs = SetBreakpointArgs(**arguments)
-                result = session.set_breakpoint(
-                    location=bp_args.location,
-                    condition=bp_args.condition,
-                    temporary=bp_args.temporary,
-                )
-
-            elif name == "gdb_list_breakpoints":
-                result = session.list_breakpoints()
-
-            elif name == "gdb_delete_breakpoint":
-                del_bp_args: BreakpointNumberArgs = BreakpointNumberArgs(**arguments)
-                result = session.delete_breakpoint(number=del_bp_args.number)
-
-            elif name == "gdb_enable_breakpoint":
-                en_bp_args: BreakpointNumberArgs = BreakpointNumberArgs(**arguments)
-                result = session.enable_breakpoint(number=en_bp_args.number)
-
-            elif name == "gdb_disable_breakpoint":
-                dis_bp_args: BreakpointNumberArgs = BreakpointNumberArgs(**arguments)
-                result = session.disable_breakpoint(number=dis_bp_args.number)
-
-            elif name == "gdb_continue":
-                result = session.continue_execution()
-
-            elif name == "gdb_step":
-                result = session.step()
-
-            elif name == "gdb_next":
-                result = session.next()
-
-            elif name == "gdb_interrupt":
-                result = session.interrupt()
-
-            elif name == "gdb_evaluate_expression":
-                eval_args: EvaluateExpressionArgs = EvaluateExpressionArgs(**arguments)
-                result = session.evaluate_expression(eval_args.expression)
-
-            elif name == "gdb_get_variables":
-                var_args: GetVariablesArgs = GetVariablesArgs(**arguments)
-                result = session.get_variables(thread_id=var_args.thread_id, frame=var_args.frame)
-
-            elif name == "gdb_get_registers":
-                result = session.get_registers()
-
-            elif name == "gdb_stop_session":
-                result = session.stop()
-                session_manager.remove_session(session_id)
-
-            elif name == "gdb_call_function":
-                call_args: CallFunctionArgs = CallFunctionArgs(**arguments)
-                result = session.call_function(function_call=call_args.function_call)
-
+                # Check if session was expired due to idle timeout
+                if session_manager.was_expired(session_id):
+                    result = {
+                        "status": "error",
+                        "message": (
+                            f"Session {session_id} has been automatically closed due to idle timeout "
+                            f"({session_manager._timeout_sec // 60} minutes). "
+                            f"Please use gdb_start_session to create a new session."
+                        ),
+                    }
+                else:
+                    result = {
+                        "status": "error",
+                        "message": f"Invalid session_id: {session_id}. Use gdb_start_session to create a new session.",
+                    }
             else:
-                result = {"status": "error", "message": f"Unknown tool: {name}"}
+                # Refresh session activity timestamp
+                session_manager.touch_session(session_id)
+
+                if name == "gdb_execute_command":
+                    exec_args: ExecuteCommandArgs = ExecuteCommandArgs(**arguments)
+                    result = session.execute_command(command=exec_args.command)
+
+                elif name == "gdb_get_status":
+                    result = session.get_status()
+
+                elif name == "gdb_get_threads":
+                    result = session.get_threads()
+
+                elif name == "gdb_select_thread":
+                    thread_args: ThreadSelectArgs = ThreadSelectArgs(**arguments)
+                    result = session.select_thread(thread_id=thread_args.thread_id)
+
+                elif name == "gdb_get_backtrace":
+                    backtrace_args: GetBacktraceArgs = GetBacktraceArgs(**arguments)
+                    result = session.get_backtrace(
+                        thread_id=backtrace_args.thread_id,
+                        max_frames=backtrace_args.max_frames,
+                    )
+
+                elif name == "gdb_select_frame":
+                    frame_args: FrameSelectArgs = FrameSelectArgs(**arguments)
+                    result = session.select_frame(frame_number=frame_args.frame_number)
+
+                elif name == "gdb_get_frame_info":
+                    result = session.get_frame_info()
+
+                elif name == "gdb_set_breakpoint":
+                    bp_args: SetBreakpointArgs = SetBreakpointArgs(**arguments)
+                    result = session.set_breakpoint(
+                        location=bp_args.location,
+                        condition=bp_args.condition,
+                        temporary=bp_args.temporary,
+                    )
+
+                elif name == "gdb_list_breakpoints":
+                    result = session.list_breakpoints()
+
+                elif name == "gdb_delete_breakpoint":
+                    del_bp_args: BreakpointNumberArgs = BreakpointNumberArgs(**arguments)
+                    result = session.delete_breakpoint(number=del_bp_args.number)
+
+                elif name == "gdb_enable_breakpoint":
+                    en_bp_args: BreakpointNumberArgs = BreakpointNumberArgs(**arguments)
+                    result = session.enable_breakpoint(number=en_bp_args.number)
+
+                elif name == "gdb_disable_breakpoint":
+                    dis_bp_args: BreakpointNumberArgs = BreakpointNumberArgs(**arguments)
+                    result = session.disable_breakpoint(number=dis_bp_args.number)
+
+                elif name == "gdb_continue":
+                    result = session.continue_execution()
+
+                elif name == "gdb_step":
+                    result = session.step()
+
+                elif name == "gdb_next":
+                    result = session.next()
+
+                elif name == "gdb_interrupt":
+                    result = session.interrupt()
+
+                elif name == "gdb_evaluate_expression":
+                    eval_args: EvaluateExpressionArgs = EvaluateExpressionArgs(**arguments)
+                    result = session.evaluate_expression(eval_args.expression)
+
+                elif name == "gdb_get_variables":
+                    var_args: GetVariablesArgs = GetVariablesArgs(**arguments)
+                    result = session.get_variables(thread_id=var_args.thread_id, frame=var_args.frame)
+
+                elif name == "gdb_get_registers":
+                    result = session.get_registers()
+
+                elif name == "gdb_stop_session":
+                    result = session.stop()
+                    session_manager.remove_session(session_id)
+
+                elif name == "gdb_call_function":
+                    call_args: CallFunctionArgs = CallFunctionArgs(**arguments)
+                    result = session.call_function(function_call=call_args.function_call)
+
+                else:
+                    result = {"status": "error", "message": f"Unknown tool: {name}"}
 
         result_text = json.dumps(result, indent=2)
         return [TextContent(type="text", text=result_text)]

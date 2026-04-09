@@ -59,6 +59,7 @@ class TestSessionRouting:
 
         # Mock the session manager to return None (invalid session)
         mock_manager.get_session.return_value = None
+        mock_manager.was_expired.return_value = False
 
         # Call tool with invalid session_id
         result = asyncio.run(call_tool("gdb_get_status", {"session_id": 999}))
